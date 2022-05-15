@@ -1,10 +1,15 @@
 use crate::email::parse_message;
 use crate::repository::MessageRepository;
 use log::{info, warn};
-use std::net::TcpListener as StdTcpListener;
+use std::io::{Read, Write};
+use std::net::{TcpListener as StdTcpListener};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+use tokio_tungstenite::{accept_async, connect_async, WebSocketStream};
+use tokio_tungstenite::tungstenite::protocol::Message as ClientMessage;
+use futures::{SinkExt, StreamExt};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -20,13 +25,19 @@ pub async fn run_smtp_server(
     tcp_listener.set_nonblocking(true).unwrap();
     let listener = TcpListener::from_std(tcp_listener)?;
 
+    let ws_addr = "127.0.0.1:3012";
+    let ws_listener = TcpListener::bind(&ws_addr).await.expect("Can't listen");
+
     loop {
+        let (ws_socket, _) = ws_listener.accept().await?;
+        let mut ws_stream = accept_async(ws_socket).await?;
+
         let (socket, remote_ip) = listener.accept().await?;
         let session_repository = Arc::clone(&repository);
 
         tokio::spawn(async move {
             let server_impl = SmtpServerImplementation::new(session_repository);
-            let mut protocol = SmtpProtocol::new(socket, server_impl);
+            let mut protocol = SmtpProtocol::new(socket, ws_stream, server_impl);
 
             match protocol.execute().await {
                 Ok(_) => {}
@@ -51,14 +62,16 @@ enum SmtpProtocolState {
 struct SmtpProtocol {
     server_impl: SmtpServerImplementation,
     stream: SmtpStream,
+    ws_stream: WebSocketStream<TcpStream>,
     state: Vec<SmtpProtocolState>,
 }
 
 impl SmtpProtocol {
-    fn new(stream: TcpStream, server_impl: SmtpServerImplementation) -> Self {
+    fn new(stream: TcpStream, ws_stream: WebSocketStream<TcpStream>, server_impl: SmtpServerImplementation) -> Self {
         SmtpProtocol {
             server_impl,
             stream: SmtpStream::new(stream),
+            ws_stream,
             state: vec![],
         }
     }
@@ -128,7 +141,11 @@ impl SmtpProtocol {
                         return Ok(());
                     }
 
-                    self.server_impl.data(data.unwrap())?;
+                    self.server_impl.data(data.unwrap()).await?;
+
+                    let msg = ClientMessage::text("NEW_MESSAGE");
+                    self.ws_stream.send(msg).await?;
+                    self.ws_stream.close(None).await?;
 
                     self.say("250 Message accepted\r\n").await?;
 
@@ -263,7 +280,7 @@ impl SmtpServerImplementation {
         self.recipients.push(recipient.to_string());
     }
 
-    fn data(&mut self, buf: &[u8]) -> Result<()> {
+    async fn data(&mut self, buf: &[u8]) -> Result<()> {
         // strip size extension
         let size_extension_index = self.sender.as_ref().and_then(|s| s.rfind("SIZE="));
 
