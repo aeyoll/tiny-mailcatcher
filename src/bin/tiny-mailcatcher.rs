@@ -4,13 +4,17 @@ use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use structopt::StructOpt;
 use tiny_mailcatcher::repository::MessageRepository;
-use tiny_mailcatcher::{http, smtp};
+use tiny_mailcatcher::{http, smtp, ws};
+use crossbeam_channel::unbounded;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     env_logger::init();
 
     let args: Options = Options::from_args();
+
+    // Channel
+    let (s, r) = unbounded();
 
     let repository = Arc::new(Mutex::new(MessageRepository::new()));
 
@@ -21,9 +25,13 @@ async fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
 
     let smtp_addr = format!("{}:{}", &args.ip, args.smtp_port);
     let smtp_listener = TcpListener::bind(smtp_addr).unwrap();
-    let smtp_handle = tokio::spawn(smtp::run_smtp_server(smtp_listener, repository.clone()));
+    let smtp_handle = tokio::spawn(smtp::run_smtp_server(smtp_listener, repository.clone(), s));
 
-    let (http_res, smtp_res) = tokio::try_join!(http_handle, smtp_handle)?;
+    let ws_addr = format!("{}:{}", &args.ip, args.ws_port);
+    let ws_listener = TcpListener::bind(ws_addr).unwrap();
+    let ws_handle = tokio::spawn(ws::run_ws_server(ws_listener, r));
+
+    let (http_res, smtp_res, ws_res) = tokio::try_join!(http_handle, smtp_handle, ws_handle)?;
 
     http_res.and(smtp_res)
 }
@@ -39,4 +47,7 @@ struct Options {
 
     #[structopt(long, name = "http-port", default_value = "1080")]
     http_port: u16,
+
+    #[structopt(long, name = "ws-port", default_value = "3012")]
+    ws_port: u16,
 }

@@ -3,6 +3,7 @@ use crate::repository::MessageRepository;
 use log::{info, warn};
 use std::net::TcpListener as StdTcpListener;
 use std::sync::{Arc, Mutex};
+use crossbeam_channel::Sender;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -11,6 +12,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 pub async fn run_smtp_server(
     tcp_listener: StdTcpListener,
     repository: Arc<Mutex<MessageRepository>>,
+    s: Sender<i32>
 ) -> Result<()> {
     info!(
         "Starting SMTP server on {}",
@@ -21,12 +23,13 @@ pub async fn run_smtp_server(
     let listener = TcpListener::from_std(tcp_listener)?;
 
     loop {
+        let s = s.clone();
         let (socket, remote_ip) = listener.accept().await?;
         let session_repository = Arc::clone(&repository);
 
         tokio::spawn(async move {
             let server_impl = SmtpServerImplementation::new(session_repository);
-            let mut protocol = SmtpProtocol::new(socket, server_impl);
+            let mut protocol = SmtpProtocol::new(socket, server_impl, s);
 
             match protocol.execute().await {
                 Ok(_) => {}
@@ -52,14 +55,16 @@ struct SmtpProtocol {
     server_impl: SmtpServerImplementation,
     stream: SmtpStream,
     state: Vec<SmtpProtocolState>,
+    s: Sender<i32>
 }
 
 impl SmtpProtocol {
-    fn new(stream: TcpStream, server_impl: SmtpServerImplementation) -> Self {
+    fn new(stream: TcpStream, server_impl: SmtpServerImplementation, s: Sender<i32>) -> Self {
         SmtpProtocol {
             server_impl,
             stream: SmtpStream::new(stream),
             state: vec![],
+            s
         }
     }
 
@@ -129,6 +134,7 @@ impl SmtpProtocol {
                     }
 
                     self.server_impl.data(data.unwrap())?;
+                    self.s.try_send(1).unwrap();
 
                     self.say("250 Message accepted\r\n").await?;
 
