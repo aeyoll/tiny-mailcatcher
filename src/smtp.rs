@@ -1,7 +1,9 @@
 use crate::email::parse_message;
 use crate::repository::MessageRepository;
+use event_listener::Event;
 use log::{info, warn};
 use std::net::TcpListener as StdTcpListener;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -11,6 +13,8 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 pub async fn run_smtp_server(
     tcp_listener: StdTcpListener,
     repository: Arc<Mutex<MessageRepository>>,
+    counter: Arc<AtomicI32>,
+    event: Arc<Event>,
 ) -> Result<()> {
     info!(
         "Starting SMTP server on {}",
@@ -24,9 +28,12 @@ pub async fn run_smtp_server(
         let (socket, remote_ip) = listener.accept().await?;
         let session_repository = Arc::clone(&repository);
 
+        let counter = Arc::clone(&counter);
+        let event = Arc::clone(&event);
+
         tokio::spawn(async move {
             let server_impl = SmtpServerImplementation::new(session_repository);
-            let mut protocol = SmtpProtocol::new(socket, server_impl);
+            let mut protocol = SmtpProtocol::new(socket, server_impl, counter, event);
 
             match protocol.execute().await {
                 Ok(_) => {}
@@ -52,14 +59,23 @@ struct SmtpProtocol {
     server_impl: SmtpServerImplementation,
     stream: SmtpStream,
     state: Vec<SmtpProtocolState>,
+    counter: Arc<AtomicI32>,
+    event: Arc<Event>,
 }
 
 impl SmtpProtocol {
-    fn new(stream: TcpStream, server_impl: SmtpServerImplementation) -> Self {
+    fn new(
+        stream: TcpStream,
+        server_impl: SmtpServerImplementation,
+        counter: Arc<AtomicI32>,
+        event: Arc<Event>,
+    ) -> Self {
         SmtpProtocol {
             server_impl,
             stream: SmtpStream::new(stream),
             state: vec![],
+            counter,
+            event,
         }
     }
 
@@ -129,6 +145,10 @@ impl SmtpProtocol {
                     }
 
                     self.server_impl.data(data.unwrap())?;
+
+                    let counter = self.counter.clone();
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    self.event.notify(usize::MAX);
 
                     self.say("250 Message accepted\r\n").await?;
 

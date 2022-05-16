@@ -1,10 +1,12 @@
+use event_listener::Event;
 use log::info;
 use std::error::Error;
 use std::net::TcpListener;
+use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 use structopt::StructOpt;
 use tiny_mailcatcher::repository::MessageRepository;
-use tiny_mailcatcher::{http, smtp};
+use tiny_mailcatcher::{http, smtp, ws};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
@@ -13,6 +15,8 @@ async fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     let args: Options = Options::from_args();
 
     let repository = Arc::new(Mutex::new(MessageRepository::new()));
+    let counter = Arc::new(AtomicI32::new(0));
+    let event = Arc::new(Event::new());
 
     info!("Tiny MailCatcher is starting");
     let http_addr = format!("{}:{}", &args.ip, args.http_port);
@@ -21,11 +25,23 @@ async fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
 
     let smtp_addr = format!("{}:{}", &args.ip, args.smtp_port);
     let smtp_listener = TcpListener::bind(smtp_addr).unwrap();
-    let smtp_handle = tokio::spawn(smtp::run_smtp_server(smtp_listener, repository.clone()));
+    let smtp_handle = tokio::spawn(smtp::run_smtp_server(
+        smtp_listener,
+        repository.clone(),
+        counter,
+        event,
+    ));
 
-    let (http_res, smtp_res) = tokio::try_join!(http_handle, smtp_handle)?;
+    let ws_addr = format!("{}:{}", &args.ip, args.ws_port);
+    let ws_listener = TcpListener::bind(ws_addr).unwrap();
+    let ws_handle = tokio::spawn(ws::run_ws_server(
+        ws_listener,
+        Arc::clone(&event),
+    ));
 
-    http_res.and(smtp_res)
+    let (http_res, smtp_res, ws_res) = tokio::try_join!(http_handle, smtp_handle, ws_handle)?;
+
+    http_res.and(smtp_res).and(ws_res)
 }
 
 #[derive(Debug, StructOpt)]
@@ -39,4 +55,7 @@ struct Options {
 
     #[structopt(long, name = "http-port", default_value = "1080")]
     http_port: u16,
+
+    #[structopt(long, name = "ws-port", default_value = "3012")]
+    ws_port: u16,
 }

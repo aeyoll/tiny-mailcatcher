@@ -5,3 +5,4 @@ pub mod email;
 pub mod http;
 pub mod repository;
 pub mod smtp;
+pub mod ws;
